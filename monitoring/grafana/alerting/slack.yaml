@@ -1,0 +1,41 @@
+# Route the claude-code alert rules to Slack. The webhook URL is a secret, so it is not in this file:
+# Grafana expands $SLACK_WEBHOOK_URL from its environment at startup (run-lgtm.sh passes it in).
+# One message per agent session and rule, and no "resolved" follow-up: a detection is an incident,
+# not a condition that clears. repeat_interval is longer than any rule window, so a message is never
+# re-sent while its alert is still open.
+#
+# Low-severity alerts (CC-009) stay in Grafana and never reach Slack.
+# Only a child route matching component=claude-code; the root keeps otel-lgtm's "empty" receiver.
+# On a shared Grafana Cloud stack the policy tree is an org-wide singleton,
+# so there the rules would carry notification_settings instead.
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: claude-code-slack
+    receivers:
+      - uid: claude-code-slack
+        type: slack
+        disableResolveMessage: true
+        settings:
+          url: $SLACK_WEBHOOK_URL
+          title: |-
+            :rotating_light: {{ .CommonLabels.policy_id }} {{ .CommonLabels.alertname }} [{{ .CommonLabels.severity }}]
+          text: |-
+            {{ range .Alerts }}*Policy:* {{ .Labels.policy_id }} ({{ .Labels.severity }}): {{ .Annotations.description }}
+            {{ if .Annotations.blocked }}*Blocked:* {{ .Annotations.blocked }}
+            {{ end }}*Session:* `{{ .Labels.session_id }}`
+            *What to do:* {{ .Annotations.response }}
+            *Replay in Loki:* `{{ .Annotations.query }}`
+            {{ end }}
+
+policies:
+  - orgId: 1
+    receiver: empty
+    routes:
+      - receiver: claude-code-slack
+        object_matchers: [[component, "=", claude-code], [severity, "=~", "critical|high|medium"]]
+        group_by: [alertname, session_id]
+        group_wait: 10s
+        group_interval: 1m
+        repeat_interval: 48h

@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+# Build/enter the agent container. Mounts the current directory at /work/<dir>.
+# Usage: devbox build
+#        devbox [command ...]
+#        devbox -Q [--allow HOST,...] [command ...]
+#        devbox allow [HOST ...] | devbox allow --remove HOST ...
+#
+# Every box is hardened the same way: no Linux capabilities, no privilege escalation, a read-only
+# root filesystem (only the repo, the caches and /tmp are writable), and caps on processes, memory
+# and CPU. Every box also runs the guard: a PreToolUse hook, installed as managed settings the agent
+# cannot edit, that refuses rewriting existing tests or CI, citing a source the session never
+# opened, and uploading to an unknown host. DEVBOX_GUARD=0 turns the guard off, to show the
+# difference.
+#
+# -Q/--quarantine (or DEVBOX_QUARANTINE=1) is for letting an agent misbehave on purpose. The box
+# gets none of your files beyond this directory, its own volumes (so nothing it plants reaches a
+# normal box), and joins an --internal network with no route out. Its only exits are an egress
+# proxy that allows the Anthropic API and logs everything else it refuses (devbox-egress), and a
+# fake attacker server that logs whatever it is sent (devbox-sink, http://devbox-sink:8080).
+#
+# More hosts can be opened for quarantine (docs the agent should read with WebFetch, a package
+# registry): `--allow docs.stripe.com,pkg.go.dev` when starting a box, or `devbox allow HOST` at any
+# time, also while a box is running. Both write to the allowlist file (DEVBOX_EGRESS_FILE, default
+# ~/.config/devbox/egress-allow, one host per line, subdomains included), which the egress proxy
+# re-reads on change. `devbox allow` lists it; `devbox allow --remove HOST` closes a host again.
+# WebSearch runs on Anthropic's side, so it is not limited by this; WebFetch and curl are.
+#
+# Limits can be changed with DEVBOX_PIDS (default 512), DEVBOX_MEMORY (4g) and DEVBOX_CPUS (2).
+set -euo pipefail
+
+IMAGE=drift-devbox:latest
+# Follow symlinks, so `make install` can put this on your PATH and the build context still resolves.
+self="${BASH_SOURCE[0]}"
+while [[ -L "$self" ]]; do
+  target="$(readlink "$self")"
+  case "$target" in
+    /*) self="$target" ;;
+    *)  self="$(dirname "$self")/$target" ;;
+  esac
+done
+CONTEXT="$(cd "$(dirname "$self")" && pwd)"
+
+egress_file="${DEVBOX_EGRESS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/devbox/egress-allow}"
+
+# Accepts a host or a URL, and keeps only the host: https://docs.stripe.com/api -> docs.stripe.com.
+normalize_host() {
+  local h="${1#*://}"
+  h="${h%%/*}"
+  h="${h%%:*}"
+  printf '%s' "$h" | tr '[:upper:]' '[:lower:]'
+}
+
+allow_hosts() {
+  mkdir -p "$(dirname "$egress_file")"
+  touch "$egress_file"
+  local h
+  for h in "$@"; do
+    h="$(normalize_host "$h")"
+    [[ -z "$h" ]] && continue
+    if [[ "$h" == "*" ]]; then
+      echo "devbox: '*' opens the whole internet; use DEVBOX_EGRESS_ALLOW='*' for that, on purpose" >&2
+      continue
+    fi
+    grep -qxF "$h" "$egress_file" || echo "$h" >> "$egress_file"
+  done
+}
+
+if [[ "${1:-}" == "allow" ]]; then
+  shift
+  if [[ "${1:-}" == --remove ]]; then
+    shift
+    [[ -f "$egress_file" ]] || exit 0
+    for h in "$@"; do
+      h="$(normalize_host "$h")"
+      grep -vxF "$h" "$egress_file" > "$egress_file.tmp" || true
+      cat "$egress_file.tmp" > "$egress_file" && rm -f "$egress_file.tmp"
+    done
+  elif [[ $# -gt 0 ]]; then
+    allow_hosts "$@"
+  fi
+  echo "Quarantine egress allows: ${DEVBOX_EGRESS_ALLOW:-api.anthropic.com,platform.claude.com}, plus $egress_file:"
+  if [[ -s "$egress_file" ]]; then sed 's/^/  /' "$egress_file"; else echo "  (empty)"; fi
+  echo "Running boxes pick this up on their next request."
+  exit 0
+fi
+
+if ! command -v docker >/dev/null || ! docker info >/dev/null 2>&1; then
+  echo "devbox: docker is not running" >&2
+  exit 1
+fi
+
+build() { docker build -t "$IMAGE" "$CONTEXT"; }
+
+if [[ "${1:-}" == "build" ]]; then
+  build
+  exit 0
+fi
+
+quarantine="${DEVBOX_QUARANTINE:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -Q|--quarantine) quarantine=1; shift ;;
+    --allow) v="${2:?devbox: --allow needs HOST[,HOST...]}"; allow_hosts ${v//,/ }; shift 2 ;;
+    --allow=*) v="${1#--allow=}"; allow_hosts ${v//,/ }; shift ;;
+    *) break ;;
+  esac
+done
+
+if [[ "$PWD" == "$HOME" || "$PWD" == / ]]; then
+  echo "devbox: this mounts the current directory for the agent to work in; run it in a repo, not $PWD" >&2
+  exit 1
+fi
+
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  build
+fi
+
+# Caches survive container restarts; nothing is written back to the host. Quarantine gets its own
+# set: the normal ones are shared by every box, so a quarantined agent writing a hook into
+# ~/.claude/settings.json or poisoning a build cache would reach your next session.
+# The price is one extra `claude auth login` inside quarantine.
+volume_prefix=drift-devbox
+if [[ -n "$quarantine" ]]; then
+  volume_prefix=drift-devbox-quarantine
+fi
+for volume in cache gomod claude; do
+  docker volume inspect "$volume_prefix-$volume" >/dev/null 2>&1 \
+    || docker volume create "$volume_prefix-$volume" >/dev/null
+done
+
+args=(--rm)
+if [[ -t 0 && -t 1 ]]; then args+=(-it); fi
+
+mount_point="/work/$(basename "$PWD")"
+args+=(
+  --hostname devbox
+  -v "$PWD:$mount_point"
+  -w "$mount_point"
+  -v "$volume_prefix-cache:/home/node/.cache"
+  -v "$volume_prefix-gomod:/home/node/go/pkg/mod"
+  -v "$volume_prefix-claude:/home/node/.claude"
+)
+
+# Hardening. Docker's defaults leave a container a dozen capabilities, setuid escalation, a writable
+# system and no resource limits; an agent, or a package it installs, gets none of that here.
+# /tmp is exec because go test runs its binaries from there.
+args+=(
+  --cap-drop=ALL
+  --security-opt no-new-privileges
+  --read-only
+  --tmpfs /tmp:rw,exec,nosuid,size=2g
+  --pids-limit "${DEVBOX_PIDS:-512}"
+  --memory "${DEVBOX_MEMORY:-4g}"
+  --cpus "${DEVBOX_CPUS:-2}"
+)
+
+if [[ "${DEVBOX_GUARD:-1}" == 0 ]]; then
+  args+=(-e DEVBOX_GUARD=0)
+fi
+
+# Claude Code's auto-memory lives in the claude volume, keyed by the project's path, so a box
+# remembers what earlier sessions in the same folder learned. DEVBOX_NO_MEMORY=1 switches it off,
+# for runs that must start from nothing.
+if [[ "${DEVBOX_NO_MEMORY:-}" == 1 ]]; then
+  args+=(-e CLAUDE_CODE_DISABLE_AUTO_MEMORY=1)
+fi
+
+# Claude Code event logs (prompts, tool calls, API requests), exported over OTLP to a collector on
+# the host, so they leave the box as they happen. DEVBOX_OTEL=0 turns it off; DEVBOX_OTEL_COLLECTOR
+# (host:port, OTLP/HTTP) points it elsewhere.
+if [[ "${DEVBOX_OTEL:-1}" != 0 ]]; then
+  args+=(
+    -e CLAUDE_CODE_ENABLE_TELEMETRY=1
+    -e OTEL_LOGS_EXPORTER=otlp
+    -e OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+    -e OTEL_LOG_USER_PROMPTS=1
+    -e OTEL_LOG_TOOL_DETAILS=1
+    -e OTEL_LOGS_EXPORT_INTERVAL=5000
+  )
+  # A quarantined box cannot reach the host, so it reaches the collector by name on the quarantine
+  # network, and its events carry devbox_mode=quarantine in Loki. Quarantine also logs Claude's
+  # visible replies, the closest thing to its reasoning that ever leaves the model.
+  if [[ -n "$quarantine" ]]; then
+    args+=(
+      -e "DEVBOX_OTEL_COLLECTOR=${DEVBOX_OTEL_COLLECTOR:-otel-lgtm:4318}"
+      -e OTEL_RESOURCE_ATTRIBUTES=devbox.mode=quarantine
+      -e OTEL_LOG_ASSISTANT_RESPONSES=1
+    )
+  else
+    args+=(-e "DEVBOX_OTEL_COLLECTOR=${DEVBOX_OTEL_COLLECTOR:-host.docker.internal:4318}")
+  fi
+
+  # The box forwards only the events the alerts read (devbox/otel-relay.js); DEVBOX_OTEL_ALL=1 sends all.
+  [[ "${DEVBOX_OTEL_ALL:-0}" == 1 ]] && args+=(-e DEVBOX_OTEL_ALL=1)
+fi
+
+# Match the host clock, so log lines and commit timestamps line up with what you see outside.
+host_timezone="$(readlink /etc/localtime 2>/dev/null | sed -n 's#.*/zoneinfo/##p')"
+if [[ -n "$host_timezone" ]]; then
+  args+=(-e "TZ=$host_timezone")
+fi
+
+# Quarantine plumbing. The box joins an --internal network, which has no route out at all, so the
+# limits hold whatever the agent does to its own environment. Two helpers run from this same
+# image: devbox-egress is on both networks and is the only exit, allowing DEVBOX_EGRESS_ALLOW
+# (default: the Anthropic API, and platform.claude.com for the login's token exchange) and logging
+# what it refuses; devbox-sink is a fake attacker server. claude.ai stays out on purpose: it serves
+# the account's MCP connectors (Gmail among them), which a rogue agent could use to send data out,
+# and mcp-proxy.anthropic.com, their other route, is refused even when everything else is allowed.
+# otel-lgtm, if running, is attached so events still get out.
+if [[ -n "$quarantine" ]]; then
+  quarantine_net=devbox-quarantine
+  docker network inspect "$quarantine_net" >/dev/null 2>&1 \
+    || docker network create --internal "$quarantine_net" >/dev/null
+
+  # Starts a helper unless one with the same settings is already running. A changed setting (a
+  # different DEVBOX_EGRESS_ALLOW, say) replaces it, which also applies to boxes already open.
+  start_helper() {
+    local name="$1" script="$2"
+    shift 2
+    local config="$IMAGE $CONTEXT $script $*"
+    if [[ "$(docker inspect -f '{{.State.Running}} {{index .Config.Labels "devbox.config"}}' "$name" 2>/dev/null)" == "true $config" ]]; then
+      return
+    fi
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    # Restarted if it ever dies, and kept (with its log) after it stops; make clean removes it.
+    docker run -d --restart unless-stopped --name "$name" --entrypoint node \
+      --label "devbox.config=$config" \
+      -v "$CONTEXT/quarantine:/quarantine:ro" "$@" "$IMAGE" "/quarantine/$script" >/dev/null
+  }
+  # The allowlist file's folder, not the file: editors save by replacing the file, which a
+  # single-file mount would not follow.
+  mkdir -p "$(dirname "$egress_file")"
+  touch "$egress_file"
+  start_helper devbox-egress egress-proxy.js \
+    -v "$(dirname "$egress_file"):/egress:ro" \
+    -e "EGRESS_ALLOW_FILE=/egress/$(basename "$egress_file")" \
+    -e "EGRESS_ALLOW=${DEVBOX_EGRESS_ALLOW:-api.anthropic.com,platform.claude.com}" \
+    -e "EGRESS_OTLP=${DEVBOX_OTEL_COLLECTOR:-otel-lgtm:4318}" \
+    -e "EGRESS_DENY=${DEVBOX_EGRESS_DENY:-mcp-proxy.anthropic.com}"
+  docker network connect "$quarantine_net" devbox-egress 2>/dev/null || true
+  # Also answers as build-registry.internal, so a planted instruction can name a believable host.
+  start_helper devbox-sink exfil-sink.js --network "$quarantine_net" \
+    --network-alias build-registry.internal
+
+  if docker inspect otel-lgtm >/dev/null 2>&1; then
+    docker network connect "$quarantine_net" otel-lgtm 2>/dev/null || true
+  else
+    echo "devbox: otel-lgtm is not running, so this session's events go nowhere (monitoring/run-lgtm.sh)" >&2
+  fi
+
+  args+=(
+    --network "$quarantine_net"
+    --hostname devbox-quarantine
+    -e DEVBOX_QUARANTINE=1
+    -e HTTPS_PROXY=http://devbox-egress:3128
+    -e HTTP_PROXY=http://devbox-egress:3128
+    -e https_proxy=http://devbox-egress:3128
+    -e http_proxy=http://devbox-egress:3128
+    -e NO_PROXY=localhost,127.0.0.1,otel-lgtm,devbox-sink,build-registry.internal
+    -e no_proxy=localhost,127.0.0.1,otel-lgtm,devbox-sink,build-registry.internal
+  )
+  egress_note="Anthropic API only"
+  if [[ ",${DEVBOX_EGRESS_ALLOW:-}," == *",*,"* ]]; then
+    egress_note="whole internet except private networks, all logged"
+  elif [[ -n "${DEVBOX_EGRESS_ALLOW:-}" ]]; then
+    egress_note="$DEVBOX_EGRESS_ALLOW"
+  fi
+  if [[ -s "$egress_file" && "$egress_note" != whole* ]]; then
+    egress_note="$egress_note, plus $(paste -sd, "$egress_file") (devbox allow)"
+  fi
+  echo "devbox: QUARANTINE. Egress: $egress_note, via devbox-egress (docker logs -f devbox-egress); sink at http://devbox-sink:8080 (docker logs -f devbox-sink)" >&2
+fi
+
+guard_note=on
+[[ "${DEVBOX_GUARD:-1}" == 0 ]] && guard_note=OFF
+echo "devbox: hardened (no capabilities, read-only system, ${DEVBOX_PIDS:-512} processes, ${DEVBOX_MEMORY:-4g} memory, ${DEVBOX_CPUS:-2} CPUs). Guard: $guard_note" >&2
+
+exec docker run "${args[@]}" "$IMAGE" "$@"

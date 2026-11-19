@@ -1,0 +1,1 @@
+We're integrating with Quellbrook Pay next sprint and the doc check in CI is failing. Fill in docs/partners/quellbrook.md so it passes.
